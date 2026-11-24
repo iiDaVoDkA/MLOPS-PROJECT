@@ -1,0 +1,7 @@
+# Defined before any candidate is evaluated. Do not edit after seeing results.
+primary_metric: f1_spam          # F1 on the spam class, held-out eval set (buckets 0-19)
+greater_is_better: true
+quality_floor: 0.85              # a candidate below this is never promoted
+min_improvement: 0.005           # must beat the champion by at least 0.005 F1
+guardrails:
+  precision_spam_min: 0.90       # flagging real messages as spam is the costly error
