@@ -1,3 +1,5 @@
 # Runtime dependencies (app and model). Python 3.11.
 mlflow==3.5.1  # must match the DagsHub server version
 pandas==2.3.3
+scikit-learn==1.9.1  # must match the version the registered model was trained with
+sqlalchemy==2.0.58  # mlflow 3.5.1 fails to import its SQL store with SQLAlchemy 2.1
