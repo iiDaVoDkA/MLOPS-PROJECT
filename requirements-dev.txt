@@ -1,0 +1,5 @@
+# Development, data and test tooling. Not installed in the production image.
+-r requirements.txt
+dvc[azure]==3.67.1
+pytest==9.2.0
+ruff==0.17.6
