@@ -27,7 +27,7 @@ gitGraph
   merge staging id: "prod PR"
 ```
 
-- `feature/*`: short-lived, branched from `dev`, merged into `dev` by reviewed PR (**squash**).
+- `feature/*`: short-lived, branched from `dev`, merged into `dev` by reviewed PR (**merge commit**).
 - `dev` → `staging` → `main`: promoted by PR (**merge commit**).
 - `main`, `staging` and `dev` are protected: changes go through a PR with 1 approval, and force pushes and deletions are blocked. Required CI checks will be added with the CI workflow.
 
