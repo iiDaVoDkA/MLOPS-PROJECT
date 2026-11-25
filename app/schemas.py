@@ -41,8 +41,9 @@ class ModelInfo(BaseModel):
     version: str
     run_id: str | None
     dataset_version: str | None
-    git_sha: str | None
+    git_sha: str | None = Field(description="Commit the model was trained from.")
     loaded_at: datetime
+    app_git_sha: str = Field(description="Commit the running app image was built from.")
 
 
 class Liveness(BaseModel):

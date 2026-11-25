@@ -20,7 +20,7 @@ gitGraph
   branch feature/x
   commit id: "work"
   checkout dev
-  merge feature/x id: "squash PR"
+  merge feature/x id: "feature PR"
   checkout staging
   merge dev id: "release PR"
   checkout main
@@ -35,4 +35,4 @@ gitGraph
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| _CI_ | _PR to dev / staging / main_ | _to be added_ |
+| ci.yml | PR to dev / staging / main | lint-test: ruff + pytest · docker: image build + container smoke test against an offline test registry |
