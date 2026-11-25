@@ -3,7 +3,7 @@
 Final-year project: machine learning in production.
 _Topic and dataset: to be decided._
 
-**Live app:** _coming soon_ · **MLflow:** https://dagshub.com/iiDaVoDkA/MLOPS-PROJECT.mlflow
+**Live app:** https://sms-spam-detector-gdlg.onrender.com · **MLflow:** https://dagshub.com/iiDaVoDkA/MLOPS-PROJECT.mlflow
 
 ## Team
 
@@ -36,3 +36,5 @@ gitGraph
 | Workflow | Trigger | What it does |
 |---|---|---|
 | ci.yml | PR to dev / staging / main | lint-test: ruff + pytest · docker: image build + container smoke test against an offline test registry |
+| staging.yml | push to staging | pytest · image build + container smoke test · push `ghcr.io/iidavodka/mlops-project:<sha>` |
+| deploy.yml | push to main | verify + push the image · deploy that exact image to Render · live smoke test (expected image + champion version). See [DEPLOYMENT.md](DEPLOYMENT.md) |

@@ -57,13 +57,67 @@ def test_passes_against_a_healthy_app(healthy):
     assert summary["empty_text_status"] == 422
 
 
-def test_reports_wrong_version_and_commit(healthy):
-    summary = smoke_test.run_checks(healthy, URL, expect_version="2", expect_app_sha="other")
+def test_reports_wrong_model_version(healthy):
+    summary = smoke_test.run_checks(healthy, URL, expect_version="2", expect_app_sha="abc123")
 
     failures = " ".join(summary["failures"])
     assert "model_version '1', expected '2'" in failures
-    assert "/model-info: version" in failures
-    assert "app_git_sha 'abc123'" in failures
+    assert "/model-info: version '1', expected '2'" in failures
+
+
+def old_then_new_image(new_after: int):
+    """Fake live URL: ready, but serves the old image for the first ``new_after`` polls."""
+    polls = {"model-info": 0}
+
+    def http(method, url, body):
+        if url.endswith("/health/ready"):
+            return 200, {"status": "ready", "model_version": "1"}
+        if url.endswith("/model-info"):
+            polls["model-info"] += 1
+            sha = "new" if polls["model-info"] > new_after else "old"
+            return 200, {"version": "1", "app_git_sha": sha}
+        if body == {"text": ""}:
+            return 422, {"detail": "too short"}
+        return 200, {"prediction": "ham", "model_version": "1"}
+
+    return http, polls
+
+
+def test_waits_until_the_new_image_serves():
+    http, polls = old_then_new_image(new_after=3)
+    sleeps = []
+
+    summary = smoke_test.run_checks(
+        http, URL, expect_version="1", expect_app_sha="new", timeout=60, sleep=sleeps.append
+    )
+
+    assert summary["failures"] == []
+    assert summary["app_git_sha"] == "new"
+    assert sleeps == [smoke_test.SHA_POLL_SECONDS] * 3  # three polls saw the old image
+    assert polls["model-info"] == 5  # four waiting polls, then the identity check
+
+
+def test_fails_clearly_when_the_new_image_never_serves():
+    http, _ = old_then_new_image(new_after=10**9)
+
+    summary = smoke_test.run_checks(
+        http, URL, expect_app_sha="new", timeout=0, sleep=lambda _: None
+    )
+
+    assert summary["failures"] == [
+        "/model-info: never served app_git_sha 'new' (last answer: app_git_sha 'old')"
+    ]
+    assert "predictions" in summary and summary["predictions"] == {}  # stopped before predicting
+
+
+def test_reports_wrong_commit_against_the_real_app(healthy):
+    summary = smoke_test.run_checks(
+        healthy, URL, expect_app_sha="other", timeout=0, sleep=lambda _: None
+    )
+
+    assert len(summary["failures"]) == 1
+    assert "never served app_git_sha 'other'" in summary["failures"][0]
+    assert "app_git_sha 'abc123'" in summary["failures"][0]
 
 
 def test_fails_when_never_ready(monkeypatch):
