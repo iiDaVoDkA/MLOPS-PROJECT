@@ -1,0 +1,259 @@
+name: ct
+# Continuous training, run by hand: retrain / promote with ml/pipeline.py, or roll the
+# champion back, then refresh and verify whatever serves that model.
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "pipeline: retrain/promote if the rule says so · rollback: move champion back"
+        type: choice
+        options: [pipeline, rollback]
+        default: pipeline
+      dataset_version:
+        description: "Dataset to validate and train on (pipeline only)"
+        type: choice
+        options: [v1, v2]
+        default: v1
+      rollback_version:
+        description: "Approved model version to make champion again (rollback only)"
+        type: string
+        required: false
+      target:
+        description: "production: live model + Render app · staging-demo: demo model, no app"
+        type: choice
+        options: [production, staging-demo]
+        default: staging-demo
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production # shared with deploy.yml: never retrain and deploy at the same time
+  cancel-in-progress: false
+
+jobs:
+  ct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      OPERATION: ${{ inputs.operation }}
+      TARGET: ${{ inputs.target }}
+      DATASET_VERSION: ${{ inputs.operation == 'pipeline' && inputs.dataset_version || '' }}
+      ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+      MODEL_ALIAS: champion
+      MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+      MLFLOW_TRACKING_USERNAME: ${{ vars.MLFLOW_TRACKING_USERNAME }}
+      MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+      PROD_URL: ${{ vars.PROD_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+
+      - name: Resolve model and check inputs
+        env:
+          PROD_MODEL_NAME: ${{ vars.MODEL_NAME }}
+          STAGING_MODEL_NAME: ${{ vars.STAGING_MODEL_NAME }}
+        run: |
+          case "$TARGET" in
+            production) name="$PROD_MODEL_NAME" ;;
+            staging-demo) name="$STAGING_MODEL_NAME" ;;
+            *) echo "::error::unknown target '$TARGET'"; exit 1 ;;
+          esac
+          if [ -z "$name" ]; then
+            echo "::error::no model name configured for target '$TARGET'"; exit 1
+          fi
+          if [ "$OPERATION" = "rollback" ] && ! [[ "$ROLLBACK_VERSION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::rollback_version must be a positive integer, got '$ROLLBACK_VERSION'"
+            exit 1
+          fi
+          echo "MODEL_NAME=$name" >> "$GITHUB_ENV"
+          echo "Operation: $OPERATION · target: $TARGET · model: $name"
+
+      - name: Pull dataset with DVC
+        if: inputs.operation == 'pipeline'
+        env:
+          AZURE_STORAGE_SAS_TOKEN: ${{ secrets.AZURE_STORAGE_SAS_TOKEN }}
+        run: |
+          dvc remote modify --local azure sas_token "$AZURE_STORAGE_SAS_TOKEN"
+          dvc pull "data/${DATASET_VERSION}.dvc"
+          ls -l "data/${DATASET_VERSION}"
+
+      - name: Run continuous-training pipeline
+        id: pipeline
+        run: |
+          if [ "$OPERATION" = "rollback" ]; then
+            python -m ml.pipeline --rollback "$ROLLBACK_VERSION" --model-name "$MODEL_NAME"
+          else
+            python -m ml.pipeline --dataset-version "$DATASET_VERSION" --model-name "$MODEL_NAME"
+          fi
+
+      - name: Read decision
+        id: decision
+        if: always() && hashFiles('results/decision.json') != ''
+        run: |
+          {
+            echo "decision=$(jq -r '.decision // ""' results/decision.json)"
+            echo "champion_before=$(jq -r '.champion_before // ""' results/decision.json)"
+            echo "champion_after=$(jq -r '.champion_after // ""' results/decision.json)"
+          } >> "$GITHUB_OUTPUT"
+          jq -r '"Decision: \(.decision) — \(.reason)"' results/decision.json
+
+      # Production: the app resolves the alias only at start-up, so restart it by
+      # re-deploying the image that is live now, then wait for the new champion.
+      - name: Read live image
+        id: live
+        if: >-
+          inputs.target == 'production' &&
+          contains(fromJSON('["bootstrapped","promoted","rolled_back"]'), steps.decision.outputs.decision)
+        run: |
+          for attempt in $(seq 1 18); do  # ~3 min: the free instance may be asleep
+            sha="$(curl -fsS --max-time 20 "$PROD_URL/model-info" | jq -r '.app_git_sha // ""' || true)"
+            if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Live image commit: $sha"
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Attempt $attempt: live app not answering with an image commit yet"
+            sleep 10
+          done
+          echo "::error::could not read app_git_sha from $PROD_URL/model-info"
+          exit 1
+
+      - name: Restart live app (re-deploy current image)
+        if: steps.live.outcome == 'success'
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          IMAGE: ghcr.io/iidavodka/mlops-project:${{ steps.live.outputs.sha }}
+        run: |
+          encoded="$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["IMAGE"], safe=""))')"
+          curl -fsS -X POST -o /dev/null "${RENDER_DEPLOY_HOOK_URL}&imgURL=${encoded}"
+          echo "Restart requested for $IMAGE"
+
+      - name: Live smoke test
+        id: live_smoke
+        if: steps.live.outcome == 'success'
+        env:
+          CHAMPION_AFTER: ${{ steps.decision.outputs.champion_after }}
+          LIVE_SHA: ${{ steps.live.outputs.sha }}
+        run: |
+          python -m scripts.smoke_test --url "$PROD_URL" \
+            --expect-version "$CHAMPION_AFTER" --expect-app-sha "$LIVE_SHA" \
+            --timeout 900 | tee results/live-smoke.json
+
+      # Staging demo: no app serves this model, so prove the new champion predicts.
+      - name: Verify demo champion
+        id: demo_verify
+        if: >-
+          inputs.target == 'staging-demo' &&
+          contains(fromJSON('["bootstrapped","promoted","rolled_back"]'), steps.decision.outputs.decision)
+        env:
+          CHAMPION_AFTER: ${{ steps.decision.outputs.champion_after }}
+        run: |
+          python - <<'EOF' | tee results/demo-verification.json
+          import json, os
+          from pathlib import Path
+
+          import mlflow
+          import pandas as pd
+          from mlflow import MlflowClient
+
+          name, alias = os.environ["MODEL_NAME"], os.environ["MODEL_ALIAS"]
+          expected = os.environ["CHAMPION_AFTER"]
+          uri = os.environ["MLFLOW_TRACKING_URI"]
+          mlflow.set_tracking_uri(uri)
+          mlflow.set_registry_uri(uri)
+
+          version = str(MlflowClient().get_model_version_by_alias(name, alias).version)
+          assert version == expected, f"{name}@{alias} is version {version}, expected {expected}"
+
+          dataset = os.environ.get("DATASET_VERSION", "")
+          eval_csv = Path("data") / dataset / "eval.csv"
+          if dataset and eval_csv.is_file():
+              rows = pd.read_csv(eval_csv, keep_default_na=False).head(3)
+              texts, labels = rows["text"].tolist(), rows["label"].tolist()
+          else:
+              texts = [
+                  "Are we still meeting for lunch tomorrow?",
+                  "WINNER! You have won a free prize. Text WIN to 80086 to claim now.",
+              ]
+              labels = ["ham", "spam"]
+
+          model = mlflow.pyfunc.load_model(f"models:/{name}/{version}")
+          predicted = [str(label) for label in model.predict(pd.DataFrame({"text": texts}))]
+          assert set(predicted) <= {"ham", "spam"}, f"unexpected labels {predicted}"
+          print(json.dumps({
+              "model_name": name,
+              "model_version": version,
+              "predictions": [
+                  {"text": t, "expected": e, "predicted": p}
+                  for t, e, p in zip(texts, labels, predicted)
+              ],
+          }, indent=2))
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-results
+          path: results/
+          if-no-files-found: warn
+
+      - name: Job summary
+        if: always()
+        env:
+          LIVE_OUTCOME: ${{ steps.live.outcome }}
+          LIVE_SMOKE_OUTCOME: ${{ steps.live_smoke.outcome }}
+          DEMO_OUTCOME: ${{ steps.demo_verify.outcome }}
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          from pathlib import Path
+
+          path = Path("results/decision.json")
+          d = json.loads(path.read_text()) if path.is_file() else {}
+          decision = d.get("decision") or "no decision (pipeline did not run)"
+          env = os.environ
+
+          if decision in ("bootstrapped", "promoted", "rolled_back"):
+              if env["TARGET"] == "production":
+                  if env.get("LIVE_OUTCOME") == "failure":
+                      verification = "failure: could not read the live image commit"
+                  else:
+                      verification = f"live smoke test: {env.get('LIVE_SMOKE_OUTCOME') or 'not run'}"
+              else:
+                  verification = f"demo prediction check: {env.get('DEMO_OUTCOME') or 'not run'}"
+          else:
+              verification = f"no refresh needed (decision: {decision})"
+
+          rows = [
+              ("operation", env["OPERATION"]),
+              ("target", env["TARGET"]),
+              ("model", d.get("model_name") or env.get("MODEL_NAME")),
+              ("dataset_version", d.get("dataset_version")),
+              ("validation", d.get("validation")),
+              ("retrained", d.get("retrained")),
+              ("decision", decision),
+              ("reason", d.get("reason")),
+              ("champion_before", d.get("champion_before")),
+              ("champion_after", d.get("champion_after")),
+              ("candidate_version", d.get("candidate_version")),
+              ("champion_score", d.get("champion_score")),
+              ("candidate_score", d.get("candidate_score")),
+              ("MLflow run_id", d.get("run_id")),
+              ("live verification", verification),
+          ]
+          print("## Continuous training\n")
+          print("| | |\n|---|---|")
+          for key, value in rows:
+              text = "—" if value in (None, "") else str(value).replace("|", "\\|")
+              print(f"| {key} | {text} |")
+          EOF
