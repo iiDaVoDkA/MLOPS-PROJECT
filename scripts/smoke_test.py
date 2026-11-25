@@ -1,8 +1,9 @@
 """Smoke-test a running instance of the app: readiness, predictions, model identity.
 
 Standard library only, so it runs anywhere (CI, a laptop, against the live URL).
-With --expect-app-sha it first waits until the URL serves that image: right after a
-deploy, Render keeps answering with the old instance until the new one is ready.
+With --expect-app-sha and/or --expect-version it first waits until the URL serves that
+image and model version: right after a deploy or restart, Render keeps answering with
+the old instance until the new one is ready.
 
     python -m scripts.smoke_test --url http://localhost:8000 --expect-version 1 \\
         --expect-app-sha "$(git rev-parse HEAD)" --timeout 120
@@ -24,7 +25,7 @@ from typing import Any
 HAM = "Are we still meeting for lunch tomorrow?"
 SPAM = "WINNER! You have won a free prize. Text WIN to 80086 to claim now."
 POLL_SECONDS = 3.0
-SHA_POLL_SECONDS = 5.0
+IDENTITY_POLL_SECONDS = 5.0
 
 # (method, url, json body or None) -> (status code, parsed JSON body or None)
 Http = Callable[[str, str, Any], tuple[int, Any]]
@@ -65,33 +66,39 @@ def wait_until_ready(
         sleep(POLL_SECONDS)
 
 
-def wait_for_app_sha(
+def wait_for_identity(
     http: Http,
     url: str,
-    expected: str,
     deadline: float,
+    expect_app_sha: str | None = None,
+    expect_version: str | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> str | None:
-    """Poll /model-info until it reports ``expected`` as app_git_sha.
+    """Poll /model-info until it reports the expected image commit and model version.
 
-    Return None once it does, or the reason it never did by ``deadline``
-    (a time.monotonic() value).
+    Each expectation that is None is not checked. Return None once every given one
+    matches, or the reason they never did by ``deadline`` (a time.monotonic() value).
     """
+    expected = {"app_git_sha": expect_app_sha, "version": expect_version}
+    expected = {key: value for key, value in expected.items() if value is not None}
+    if not expected:
+        return None
+    wanted = " and ".join(f"{key} {value!r}" for key, value in expected.items())
     last = "no response"
     while True:
         try:
             status, info = http("GET", f"{url}/model-info", None)
             if status == 200 and isinstance(info, dict):
-                if info.get("app_git_sha") == expected:
+                if all(info.get(key) == value for key, value in expected.items()):
                     return None
-                last = f"app_git_sha {info.get('app_git_sha')!r}"
+                last = ", ".join(f"{key} {info.get(key)!r}" for key in expected)
             else:
                 last = f"HTTP {status}: {info}"
         except (OSError, urllib.error.URLError) as error:
             last = f"{type(error).__name__}: {error}"
         if time.monotonic() >= deadline:
-            return f"never served app_git_sha {expected!r} (last answer: {last})"
-        sleep(SHA_POLL_SECONDS)
+            return f"never served {wanted} (last answer: {last})"
+        sleep(IDENTITY_POLL_SECONDS)
 
 
 def run_checks(
@@ -114,11 +121,10 @@ def run_checks(
         return summary
     summary["ready"] = True
 
-    if expect_app_sha is not None:
-        wrong_image = wait_for_app_sha(http, url, expect_app_sha, deadline, sleep)
-        if wrong_image:
-            failures.append(f"/model-info: {wrong_image}")
-            return summary
+    wrong_identity = wait_for_identity(http, url, deadline, expect_app_sha, expect_version, sleep)
+    if wrong_identity:
+        failures.append(f"/model-info: {wrong_identity}")
+        return summary
 
     for name, text in (("ham", HAM), ("spam", SPAM)):
         status, body = http("POST", f"{url}/predict", {"text": text})
@@ -160,15 +166,20 @@ def run_checks(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--url", required=True, help="base URL, e.g. http://localhost:8000")
-    parser.add_argument("--expect-version", help="registry version the app must serve")
+    parser.add_argument(
+        "--expect-version", help="registry version the app must serve (waits for it)"
+    )
     parser.add_argument("--expect-app-sha", help="commit the image must report (waits for it)")
     parser.add_argument(
         "--timeout",
         type=float,
         default=120.0,
-        help="seconds to wait for ready and for the expected image",
+        help="seconds to wait for ready and for the expected image and version",
     )
     args = parser.parse_args(argv)
+    for option in ("expect_version", "expect_app_sha"):
+        if getattr(args, option) == "":
+            parser.error(f"--{option.replace('_', '-')} was given an empty value")
 
     summary = run_checks(
         urllib_http, args.url, args.expect_version, args.expect_app_sha, args.timeout
