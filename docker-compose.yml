@@ -1,0 +1,50 @@
+services:
+  api:
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-local}
+    environment:
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD}
+      MODEL_NAME: ${MODEL_NAME}
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SMTP_ENABLED: ${SMTP_ENABLED:-false}
+      GF_SMTP_HOST: ${SMTP_HOST:-}
+      GF_SMTP_USER: ${SMTP_USER:-}
+      GF_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-grafana@localhost}
+      ALERT_EMAIL: ${ALERT_EMAIL:-alerts@example.com}
+    volumes:
+      - ./monitoring/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./monitoring/grafana/alerts.yml:/etc/grafana/provisioning/alerting/alerts.yml:ro
+      - ./monitoring/grafana/dashboard.json:/var/lib/grafana/dashboards/dashboard.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

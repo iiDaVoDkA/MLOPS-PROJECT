@@ -1,0 +1,110 @@
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: email
+    receivers:
+      - uid: email-alerts
+        type: email
+        settings:
+          addresses: $ALERT_EMAIL
+          singleEmail: true
+
+policies:
+  - orgId: 1
+    receiver: email
+    group_by: [alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+
+groups:
+  - orgId: 1
+    name: sms-spam-api
+    folder: SMS spam alerts
+    interval: 30s
+    rules:
+      - uid: api-down
+        title: API down
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: up{job="api"}
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+        for: 1m
+        noDataState: Alerting
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: Prometheus has not been able to scrape the API for 1 minute.
+
+      - uid: predict-5xx
+        title: 5xx on /predict above 5%
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: >-
+                (sum(rate(http_requests_total{path="/predict",status=~"5.."}[2m])) or vector(0))
+                / (sum(rate(http_requests_total{path="/predict"}[2m])) > 0)
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.05]}
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: More than 5% of /predict requests failed with a 5xx over the last 2 minutes.
+
+      - uid: spam-share-drift
+        title: Spam prediction share at or above 40%
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: spam_prediction_share
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gte, params: [0.40]}
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            At least 40% of the last 500 predictions are spam (about 13% in the training data).
+            Investigate the incoming traffic and the model, do not retrain automatically.
