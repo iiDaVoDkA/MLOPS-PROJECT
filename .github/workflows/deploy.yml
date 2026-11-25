@@ -1,0 +1,142 @@
+name: deploy
+# Production: verify the image for this commit, publish it, deploy exactly that image
+# to Render, then smoke-test the live URL until it serves this commit and the champion.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: production # shared with the continuous-training workflow
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      IMAGE: ghcr.io/iidavodka/mlops-project:${{ github.sha }}
+      GIT_SHA: ${{ github.sha }}
+      PROD_URL: ${{ vars.PROD_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+
+      # 1. Verify the image offline, then publish it under the commit SHA.
+      - name: Build offline test registry
+        run: |
+          python -m scripts.make_test_registry --root /tmp/ci-registry --force
+          chmod -R a+rwX /tmp/ci-registry
+      - name: Build image
+        run: |
+          docker build --build-arg GIT_SHA="$GIT_SHA" \
+            --label org.opencontainers.image.source=https://github.com/iiDaVoDkA/MLOPS-PROJECT \
+            -t "$IMAGE" .
+      - name: Start container
+        run: |
+          docker run -d --name app -p 8000:8000 \
+            -v /tmp/ci-registry:/tmp/ci-registry \
+            -e MLFLOW_TRACKING_URI=sqlite:////tmp/ci-registry/mlflow.db \
+            -e MODEL_NAME=sms-spam-classifier -e MODEL_ALIAS=champion \
+            "$IMAGE"
+      - name: Container smoke test
+        id: container_smoke
+        run: |
+          python -m scripts.smoke_test --url http://localhost:8000 --expect-version 1 \
+            --expect-app-sha "$GIT_SHA" --timeout 120
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image
+        run: docker push "$IMAGE"
+
+      # 2. Which model version must the live app serve?
+      - name: Expected model version
+        id: expected
+        env:
+          MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ vars.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+          MODEL_NAME: ${{ vars.MODEL_NAME }}
+          MODEL_ALIAS: champion
+        run: |
+          version="$(python -m scripts.champion_version)"
+          echo "Expected model version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # 3. Deploy exactly this image. The hook URL is a secret: never echo it.
+      - name: Trigger Render deploy
+        id: render
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          encoded="$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["IMAGE"], safe=""))')"
+          curl -fsS -X POST -o /dev/null "${RENDER_DEPLOY_HOOK_URL}&imgURL=${encoded}"
+          echo "Deploy requested for $IMAGE"
+
+      # 4. Live smoke test: waits until the URL serves this commit (free tier: cold
+      #    start + model download can take minutes), then checks predictions.
+      - name: Live smoke test
+        id: live_smoke
+        env:
+          EXPECTED_VERSION: ${{ steps.expected.outputs.version }}
+        run: |
+          python -m scripts.smoke_test --url "$PROD_URL" \
+            --expect-version "$EXPECTED_VERSION" --expect-app-sha "$GIT_SHA" \
+            --timeout 900 | tee smoke-live.json
+
+      - name: Job summary
+        if: always()
+        env:
+          EXPECTED_VERSION: ${{ steps.expected.outputs.version }}
+          LIVE_OUTCOME: ${{ steps.live_smoke.outcome }}
+          RENDER_OUTCOME: ${{ steps.render.outcome }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          served="$(python -c 'import json; print(json.load(open("smoke-live.json")).get("model_version", "?"))' 2>/dev/null || echo "?")"
+          {
+            echo "## Production deploy"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`$GIT_SHA\` |"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Live URL | $PROD_URL |"
+            echo "| Expected model version | ${EXPECTED_VERSION:-unknown} |"
+            echo "| Served model version | $served |"
+            echo "| Render deploy hook | ${RENDER_OUTCOME:-not run} |"
+            echo "| Live smoke test | ${LIVE_OUTCOME:-not run} |"
+            if [ "$LIVE_OUTCOME" = "failure" ]; then
+              echo ""
+              echo "> **The live smoke test failed.** Render keeps the previous healthy instance"
+              echo "> serving until a new one passes \`/health/ready\`, so users should still be on"
+              echo "> the old version. Check the Render logs, then follow the rollback procedure in"
+              echo "> [DEPLOYMENT.md](${REPO_URL}/blob/${GIT_SHA}/DEPLOYMENT.md#rollback)."
+            fi
+            if [ -s smoke-live.json ]; then
+              echo ""
+              echo "<details><summary>Live smoke test output</summary>"
+              echo ""
+              echo '```json'
+              cat smoke-live.json
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Container logs
+        if: always()
+        run: docker logs app || true
