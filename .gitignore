@@ -19,3 +19,6 @@ mlflow.db
 .DS_Store
 .idea/
 .vscode/
+
+# CT pipeline output
+results/

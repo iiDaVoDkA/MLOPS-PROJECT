@@ -28,6 +28,12 @@ Defined in [`gates.yaml`](gates.yaml), committed in `922820f` before any model w
 | `quality_floor` | `0.85` | a candidate below this is never promoted, even with no champion |
 | `min_improvement` | `0.005` | a candidate must beat the champion by at least this much; a tie is rejected |
 | `guardrails.precision_spam_min` | `0.90` | a candidate with lower spam precision is rejected whatever its F1 |
+| `retrain.max_f1_drop` | `0.03` | the CT pipeline retrains when the champion's F1 falls this far below the value recorded at approval |
+
+The CT pipeline (`ml/pipeline.py`) scores the champion first and retrains only when the data
+version is newer than the champion's, the champion is below the quality floor, or its F1 dropped
+by at least `max_f1_drop`. Otherwise it keeps the champion without training
+(`retain_no_retraining`). The retraining rule was added in its own commit before any CT run.
 
 The rule is the pure function `should_promote` in [`promote.py`](promote.py). Checks run in this
 order: valid score, quality floor, guardrails, improvement over the champion. Anything that cannot

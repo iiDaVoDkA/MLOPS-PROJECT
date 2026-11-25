@@ -5,3 +5,5 @@ quality_floor: 0.85              # a candidate below this is never promoted
 min_improvement: 0.005           # must beat the champion by at least 0.005 F1
 guardrails:
   precision_spam_min: 0.90       # flagging real messages as spam is the costly error
+retrain:
+  max_f1_drop: 0.03
