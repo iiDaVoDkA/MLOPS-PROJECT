@@ -6,6 +6,7 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -123,6 +124,7 @@ def create_app(load_in_background: bool = True) -> FastAPI:
             dataset_version=loaded.dataset_version,
             git_sha=loaded.git_sha,
             loaded_at=loaded.loaded_at,
+            app_git_sha=os.environ.get("GIT_SHA") or "unknown",
         )
 
     @app.get("/health/live", response_model=Liveness)

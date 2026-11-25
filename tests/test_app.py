@@ -136,6 +136,7 @@ def test_model_info_reports_champion_not_newer_candidate(client, registry):
         "dataset_version",
         "git_sha",
         "loaded_at",
+        "app_git_sha",
     }
     assert info["name"] == registry["model_name"]
     assert info["alias"] == "champion"
@@ -150,6 +151,16 @@ def test_model_info_reports_champion_not_newer_candidate(client, registry):
         registry["model_name"], registry["champion_version"]
     )
     assert info["run_id"] == champion.run_id
+
+
+@pytest.mark.parametrize(("value", "expected"), [("abc123", "abc123"), (None, "unknown")])
+def test_model_info_reports_the_app_commit(client, monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("GIT_SHA", raising=False)
+    else:
+        monkeypatch.setenv("GIT_SHA", value)
+
+    assert client.get("/model-info").json()["app_git_sha"] == expected
 
 
 def test_alias_is_resolved_at_startup_not_hard_coded(registry, monkeypatch):
