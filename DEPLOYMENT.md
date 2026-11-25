@@ -181,3 +181,20 @@ Use `target: staging-demo` to rehearse without touching production.
 
 For production, run the same with `target: production` and check the job summary: the
 "live verification" row shows the live smoke-test result.
+
+## Twelve-factor app
+
+| # | Factor | How this project implements it |
+|---|---|---|
+| I | Codebase | One Git repo (`MLOPS-PROJECT`) holds the app, ML code, tests, docs and workflows. The same codebase runs in several deploys: CI containers, the staging validation, and production on Render. Each image is tagged with the commit SHA it was built from. |
+| II | Dependencies | Every dependency is pinned: `requirements.txt` (runtime, the only file installed in the image) and `requirements-dev.txt` (training, DVC, tests). The image installs them into an isolated virtualenv. The health check uses only the Python standard library, so it needs no system tool. |
+| III | Config | Everything that changes between deploys comes from environment variables: `MLFLOW_TRACKING_URI`, `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD`, `MODEL_NAME`, `MODEL_ALIAS`, `PORT`. Secrets live in Render's environment and in GitHub secrets, never in the code or the image. `.env.example` lists every variable, with the secret values left empty. |
+| IV | Backing services | The MLflow registry (DagsHub) and the data store (Azure Blob through DVC) are attached resources, reached by URL and credentials from config. Swapping one needs no code change: CI points `MLFLOW_TRACKING_URI` at a local SQLite test registry instead of DagsHub. |
+| V | Build, release, run | **Build:** CI builds the Docker image and tags it with the commit SHA. **Release:** that image plus Render's environment config, deployed by `deploy.yml` through the deploy hook (`imgURL` = the exact SHA tag). **Run:** Render runs the container. A release is never edited in place; a fix is a new commit and a new image. The model has its own release step: the CT workflow moves the `champion` alias, and the app picks it up at its next start. |
+| VI | Processes | The app is stateless. It keeps only the loaded model in memory; the only files it writes are the model artifacts MLflow downloads to a temporary folder at start-up, which a new instance simply downloads again. Any instance can be killed and replaced without losing data. |
+| VII | Port binding | The app is self-contained: uvicorn serves HTTP on the port given in `$PORT` (set by Render, default 8000). No external web server is needed. |
+| VIII | Concurrency | **Limited relevance here.** The free Render plan runs a single instance with one uvicorn worker, which is enough for this traffic. Because processes are stateless, scaling out would only mean running more instances behind Render's load balancer. |
+| IX | Disposability | The process is live immediately and loads the model in the background. `/health/ready` reports ready only after a test prediction succeeds, and Render routes traffic to a new instance only then. The container runs uvicorn with `exec`, so it receives `SIGTERM` directly and shuts down cleanly. |
+| X | Dev/prod parity | The same Dockerfile builds the image in CI, in the staging validation and in production, and production runs exactly the image that `deploy.yml` has just verified. The tools are the same everywhere (pinned MLflow 3.5.1, the same Python 3.11). The one deliberate difference: CI uses an offline SQLite registry with a small test model, production uses DagsHub with the real champion. |
+| XI | Logs | The app writes its logs to standard output as an event stream and never manages log files. Render collects and shows them. |
+| XII | Admin processes | One-off tasks run as separate commands from the same repo and pinned dependencies, never inside the web container: `ml/prepare_data.py` (build a dataset version), `ml/train.py` (baseline), `ml/pipeline.py` (continuous training and rollback, run by `ct.yml`), `scripts/smoke_test.py` (live verification). |
