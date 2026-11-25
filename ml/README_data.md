@@ -52,15 +52,23 @@ archive does not match the sha256 above, so a silent upstream change cannot alte
 | Version | Content | Git tag | DVC hash (`data/<version>.dvc`) |
 |---|---|---|---|
 | `v1` | eval + training batch 1 (1,580 training rows) | `data-v1` | `5a5df1283f2ddd03bb210cc9db4ff898.dir` |
-| `v2` | eval + training batches 1 and 2 (4,168 training rows) | _planned_ | _planned_ |
+| `v2` | eval + training batches 1 and 2 (4,168 training rows) | `data-v2` | `aa465d0a6458dad7b057af7261765687.dir` |
+
+Each Git tag points at the merge commit on `dev` that added the version's `.dvc` pointer.
 
 **What changes between v1 and v2:** v2 simulates a new delivery of labelled messages. It adds
-training batch 2 (2,588 messages) to the v1 training set. The evaluation set and the v1 training
-rows are unchanged.
+training batch 2 (buckets 50–99: 2,588 messages, 2,284 ham and 304 spam) to the v1 training set,
+which grows from 1,580 to 4,168 rows (12.3% spam). Nothing else changes: the evaluation file is
+byte-identical to v1's, every v1 training row is still present, labels are untouched, and the
+source snapshot and processing are the same. Because only training data grows, a champion trained
+on v1 and a candidate trained on v2 can be compared directly on the same 991 held-out messages.
+
+v2 was built with `python -m ml.prepare_data --version v2` from the same snapshot and passes the
+data contract. It has not been used for training yet: the continuous-training workflow trains on it.
 
 ## Data contract
 
-`python -m ml.data_contract data/v1` exits non-zero and lists every violation if any check fails:
+`python -m ml.data_contract data/<version>` exits non-zero and lists every violation if any check fails:
 
 - both files exist with exactly the columns `id,label,text`, all strings;
 - no missing or blank values;
@@ -73,7 +81,7 @@ rows are unchanged.
 ## Getting the data
 
 ```bash
-dvc pull data/v1.dvc
+dvc pull data/v1.dvc data/v2.dvc
 ```
 
 The DVC remote is Azure Blob Storage. Credentials are never committed: provide them through the
