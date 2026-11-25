@@ -1,0 +1,8 @@
+# Development, data, training and test tooling. Not installed in the production image.
+-r requirements.txt
+dvc[azure]==3.67.1
+httpx2==2.16.2  # required by FastAPI's TestClient
+matplotlib==3.11.2
+PyYAML==6.0.4
+pytest==9.2.0
+ruff==0.17.6
