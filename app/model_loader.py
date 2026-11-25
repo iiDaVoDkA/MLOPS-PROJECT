@@ -7,7 +7,6 @@ itself), MODEL_NAME and MODEL_ALIAS. Nothing here is tied to a registry host.
 
 from __future__ import annotations
 
-import logging
 import os
 import threading
 from collections.abc import Mapping
@@ -16,8 +15,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
+import structlog
 
-logger = logging.getLogger("app.model")
+from app.monitoring import configure_logging
+
+log = structlog.get_logger("app.model")
 
 LABELS = ("ham", "spam")
 POSITIVE_LABEL = "spam"
@@ -88,7 +90,7 @@ class LoadedModel:
             classes = [str(c) for c in raw.classes_]
             return float(raw.predict_proba(frame)[0][classes.index(POSITIVE_LABEL)])
         except Exception:
-            logger.debug("Could not compute a spam probability", exc_info=True)
+            log.debug("spam_probability_unavailable", exc_info=True)
             return None
 
 
@@ -113,13 +115,13 @@ def resolve_and_load(settings: Settings) -> LoadedModel:
             run_tags = client.get_run(version.run_id).data.tags
             tags = {**run_tags, **tags}
         except Exception:
-            logger.warning("Could not read tags of run %s", version.run_id, exc_info=True)
+            log.warning("run_tags_unavailable", run_id=version.run_id, exc_info=True)
 
     raw_model = None
     try:
         raw_model = model.get_raw_model()
     except Exception:
-        logger.debug("Model exposes no raw model", exc_info=True)
+        log.debug("raw_model_unavailable", exc_info=True)
 
     return LoadedModel(
         name=settings.model_name,
@@ -166,28 +168,34 @@ class ModelService:
             settings = Settings.from_env()
         except ConfigurationError as error:
             self._reason, self._retryable = f"configuration error: {error}", False
-            logger.error("Cannot load a model: %s", error)
+            log.error("model_config_error", error=str(error))
             return False
 
         try:
             candidate = resolve_and_load(settings)
             candidate.predict(READINESS_SAMPLE)
         except Exception as error:
+            configure_logging()
             # Details go to the log only: the health endpoint is public.
             self._reason = f"model could not be loaded ({type(error).__name__})"
             self._retryable = True
-            logger.exception("Loading %s@%s failed", settings.model_name, settings.model_alias)
+            log.exception(
+                "model_load_failed",
+                model_name=settings.model_name,
+                model_alias=settings.model_alias,
+            )
             return False
 
+        configure_logging()
         self._loaded = candidate
-        logger.info(
-            "Serving %s version %s (alias %s, run %s, dataset %s, git %s)",
-            candidate.name,
-            candidate.version,
-            candidate.alias,
-            candidate.run_id,
-            candidate.dataset_version,
-            candidate.git_sha,
+        log.info(
+            "model_loaded",
+            model_name=candidate.name,
+            model_version=candidate.version,
+            dataset_version=candidate.dataset_version,
+            model_alias=candidate.alias,
+            run_id=candidate.run_id,
+            git_sha=candidate.git_sha,
         )
         return True
 

@@ -5,18 +5,24 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
 from __future__ import annotations
 
-import logging
 import os
-import sys
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import structlog
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app.model_loader import ModelNotReady, ModelService
+from app.monitoring import (
+    add_request_middleware,
+    configure_logging,
+    metrics_response,
+    record_prediction,
+)
 from app.schemas import (
     MAX_TEXT_LENGTH,
     Liveness,
@@ -26,22 +32,7 @@ from app.schemas import (
     Readiness,
 )
 
-
-def configure_logging() -> None:
-    """Send the app's own logs to stdout as an event stream.
-
-    The ``app`` logger gets its own handler instead of relying on the root
-    logger, which libraries may reconfigure after start-up.
-    """
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    app_logger = logging.getLogger("app")
-    app_logger.handlers = [handler]
-    app_logger.setLevel(logging.INFO)
-    app_logger.propagate = False
-
-
-configure_logging()
+log = structlog.get_logger("app.predict")
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -74,6 +65,7 @@ def create_app(load_in_background: bool = True) -> FastAPI:
     live immediately and becomes ready once a test prediction has succeeded.
     Tests pass ``load_in_background=False`` to load before the first request.
     """
+    configure_logging()
     service = ModelService()
 
     @asynccontextmanager
@@ -90,6 +82,7 @@ def create_app(load_in_background: bool = True) -> FastAPI:
 
     app = FastAPI(title="SMS spam detector", lifespan=lifespan)
     app.state.model_service = service
+    add_request_middleware(app)
 
     @app.exception_handler(ModelNotReady)
     async def model_not_ready(_: Request, error: ModelNotReady) -> JSONResponse:
@@ -104,11 +97,22 @@ def create_app(load_in_background: bool = True) -> FastAPI:
     @app.post("/predict", response_model=PredictResponse)
     def predict(body: PredictRequest) -> PredictResponse:
         loaded = service.require()
+        start = time.perf_counter()
         try:
             label, probability = loaded.predict(body.text)
         except Exception as error:
-            logging.getLogger("app").exception("Prediction failed")
+            log.exception("prediction_failed", model_version=loaded.version)
             raise HTTPException(status_code=503, detail="The model could not answer.") from error
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        record_prediction(label, loaded.version, len(body.text))
+        log.info(
+            "prediction_made",
+            model_version=loaded.version,
+            prediction=label,
+            spam_probability=probability,
+            latency_ms=latency_ms,
+            text_length=len(body.text),
+        )
         return PredictResponse(
             prediction=label, spam_probability=probability, model_version=loaded.version
         )
@@ -138,6 +142,11 @@ def create_app(load_in_background: bool = True) -> FastAPI:
             body = Readiness(status="not_ready", reason=service.not_ready_reason)
             return JSONResponse(status_code=503, content=body.model_dump(exclude_none=True))
         return Readiness(status="ready", model_version=loaded.version)
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        loaded = service.loaded
+        return metrics_response(loaded.version if loaded else None)
 
     return app
 
