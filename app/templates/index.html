@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SMS spam detector</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #5c6670; --border: #d5dae0;
+      --accent: #2456c9; --accent-text: #ffffff; --ham: #1a7f4b; --spam: #c0392b; --track: #e6e9ed;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #14171b; --card: #1d2126; --text: #e8eaed; --muted: #a0a8b1; --border: #343a42;
+        --accent: #7aa2ff; --accent-text: #0e1420; --ham: #5fd39a; --spam: #ff8a7a; --track: #2b3138;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 32px 16px; background: var(--bg); color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    main { max-width: 640px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; margin: 0 0 4px; }
+    p.lead { margin: 0 0 24px; color: var(--muted); }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+    label { display: block; font-weight: 600; margin-bottom: 8px; }
+    textarea {
+      width: 100%; min-height: 120px; padding: 12px; resize: vertical; font: inherit;
+      color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    }
+    textarea:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+    .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 6px; }
+    .count { font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .samples { margin: 16px 0 0; }
+    .samples span { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 6px; }
+    .samples div { display: flex; flex-wrap: wrap; gap: 8px; }
+    button { font: inherit; cursor: pointer; border-radius: 8px; padding: 8px 14px; }
+    button.sample { background: transparent; color: var(--text); border: 1px solid var(--border); font-size: .9rem; }
+    button.sample:hover { border-color: var(--accent); }
+    button.primary {
+      margin-top: 20px; width: 100%; padding: 12px; border: 0; font-weight: 600;
+      background: var(--accent); color: var(--accent-text);
+    }
+    button.primary:disabled { opacity: .6; cursor: progress; }
+    #result { margin-top: 20px; }
+    #result[hidden] { display: none; }
+    .verdict { font-size: 1.4rem; font-weight: 700; margin: 0; }
+    .verdict.ham { color: var(--ham); }
+    .verdict.spam { color: var(--spam); }
+    .detail { margin: 4px 0 0; color: var(--muted); }
+    .bar { height: 8px; margin-top: 12px; background: var(--track); border-radius: 4px; overflow: hidden; }
+    .bar > div { height: 100%; width: 0; background: var(--spam); transition: width .25s; }
+    .error { margin: 0; color: var(--spam); font-weight: 600; }
+    footer { margin-top: 20px; font-size: .85rem; color: var(--muted); }
+    footer code { font-size: .85rem; }
+    footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SMS spam detector</h1>
+  <p class="lead">Paste a text message to check whether it looks like spam.</p>
+
+  <form id="form" class="card" novalidate>
+    <label for="text">Message</label>
+    <textarea id="text" name="text" maxlength="{{ max_length }}" required
+              placeholder="Type or paste an SMS message…" aria-describedby="count"></textarea>
+    <div class="row">
+      <span></span>
+      <span id="count" class="count">0 / {{ max_length }}</span>
+    </div>
+
+    <div class="samples">
+      <span>Load a sample input</span>
+      <div>
+        {% for sample in samples %}
+        <button type="button" class="sample" data-sample="{{ loop.index0 }}">{{ sample.label }}</button>
+        {% endfor %}
+      </div>
+    </div>
+
+    <button id="submit" type="submit" class="primary">Check message</button>
+  </form>
+
+  <section id="result" class="card" aria-live="polite" hidden></section>
+
+  <footer id="model">Model: loading…</footer>
+</main>
+
+<script>
+  const SAMPLES = {{ samples | tojson }};
+  const MAX_LENGTH = {{ max_length }};
+
+  const form = document.getElementById("form");
+  const text = document.getElementById("text");
+  const count = document.getElementById("count");
+  const submit = document.getElementById("submit");
+  const result = document.getElementById("result");
+  const model = document.getElementById("model");
+
+  function el(tag, className, content) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (content !== undefined) node.textContent = content;
+    return node;
+  }
+
+  function updateCount() { count.textContent = `${text.value.length} / ${MAX_LENGTH}`; }
+  text.addEventListener("input", updateCount);
+
+  document.querySelectorAll("button.sample").forEach((button) => {
+    button.addEventListener("click", () => {
+      text.value = SAMPLES[Number(button.dataset.sample)].text;
+      updateCount();
+      result.hidden = true;
+      text.focus();
+    });
+  });
+
+  function showError(message) {
+    result.replaceChildren(el("p", "error", message));
+    result.hidden = false;
+  }
+
+  function describeError(status, body) {
+    if (status === 422) return `Enter a message of 1 to ${MAX_LENGTH} characters.`;
+    if (typeof body.detail === "string") return body.detail;
+    return `The request failed (HTTP ${status}).`;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    try {
+      const response = await fetch("/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text.value }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) { showError(describeError(response.status, body)); return; }
+
+      const isSpam = body.prediction === "spam";
+      const nodes = [el("p", `verdict ${body.prediction}`, isSpam ? "Spam" : "Not spam")];
+      if (typeof body.spam_probability === "number") {
+        const percent = Math.round(body.spam_probability * 100);
+        nodes.push(el("p", "detail", `Estimated probability of spam: ${percent}%`));
+        const bar = el("div", "bar");
+        const fill = el("div");
+        fill.style.width = `${percent}%`;
+        bar.append(fill);
+        nodes.push(bar);
+      }
+      nodes.push(el("p", "detail", `Answered by model version ${body.model_version}`));
+      result.replaceChildren(...nodes);
+      result.hidden = false;
+    } catch (error) {
+      showError("Could not reach the server.");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  async function loadModelInfo() {
+    try {
+      const response = await fetch("/model-info");
+      if (!response.ok) {
+        model.textContent = "Model: not ready yet. Retrying…";
+        setTimeout(loadModelInfo, 5000);
+        return;
+      }
+      const info = await response.json();
+      const parts = [
+        `Model: ${info.name} · version ${info.version} (alias ${info.alias})`,
+        info.dataset_version ? `data ${info.dataset_version}` : null,
+        info.git_sha ? `git ${info.git_sha.slice(0, 7)}` : null,
+        `loaded ${new Date(info.loaded_at).toLocaleString()}`,
+      ].filter(Boolean);
+      const link = el("a", null, "details");
+      link.href = "/model-info";
+      model.replaceChildren(document.createTextNode(parts.join(" · ") + " · "), link);
+    } catch (error) {
+      model.textContent = "Model: information unavailable.";
+    }
+  }
+
+  updateCount();
+  loadModelInfo();
+</script>
+</body>
+</html>
