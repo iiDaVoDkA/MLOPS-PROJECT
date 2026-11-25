@@ -11,8 +11,10 @@ Live app: https://sms-spam-detector-gdlg.onrender.com (Render, free tier, runs a
 | push to `main` | `deploy.yml` | `deploy` | Same verification, push the image, deploy **that exact image** to Render, then smoke-test the live URL. |
 
 Both `staging.yml` and `deploy.yml` can also be started by hand (`workflow_dispatch`).
+`ct.yml` (continuous training and model rollback) only runs by hand: see
+[Continuous training](#continuous-training).
 `deploy.yml` runs in the `production` concurrency group. The continuous-training workflow
-(to be added) will use the same group, so a deploy and a model promotion never run at the same time.
+(`ct.yml`) uses the same group, so a deploy and a model promotion never run at the same time.
 
 ### Image tags
 
@@ -98,11 +100,84 @@ python -m scripts.smoke_test --url "$PROD_URL" --expect-app-sha "$GOOD_SHA" --ti
 
 Then revert the bad commit on `main` through a PR, so the next deploy does not bring it back.
 
-**Model rollback** (a bad champion): move the `champion` alias back to the previous version with
-the continuous-training pipeline (MLflow variables in the environment), then restart the app so
-it resolves the alias again (redeploy the current image with the hook above):
+**Model rollback** (a bad champion): run the `ct` workflow (Actions → ct → Run workflow) with
+`operation: rollback`, `rollback_version: <previous approved version>` and `target: production`.
+It moves the `champion` alias back (only to a version that was approved), restarts the live app
+by re-deploying the image that is live now, and waits until `/model-info` reports that version.
+See [Continuous training](#continuous-training).
+
+By hand, with the MLflow variables in the environment:
 
 ```bash
 python -m ml.pipeline --rollback <previous version>
+# restart: re-deploy the live image (app rollback commands above, with the current app_git_sha)
 python -m scripts.smoke_test --url "$PROD_URL" --expect-version <previous version> --timeout 900
 ```
+
+## Continuous training
+
+`.github/workflows/ct.yml` is started by hand (Actions → ct → Run workflow). It runs
+`ml/pipeline.py` and then refreshes and verifies whatever serves the model. It uses the
+`production` concurrency group, like `deploy.yml`, so a retrain and a deploy never overlap.
+
+### Inputs
+
+| Input | Values | Used by |
+|---|---|---|
+| `operation` | `pipeline` (default), `rollback` | — |
+| `dataset_version` | `v1` (default), `v2` | pipeline: pulled with DVC from the Azure remote, validated, used for scoring and training |
+| `rollback_version` | a positive integer | rollback: the approved version to make champion again (checked before anything runs) |
+| `target` | `staging-demo` (default), `production` | `production` → `vars.MODEL_NAME` (served by the live app); `staging-demo` → `vars.STAGING_MODEL_NAME` (no app) |
+
+Secrets and variables (environment `production`): `MLFLOW_TRACKING_URI`, `MLFLOW_TRACKING_USERNAME`,
+`MLFLOW_TRACKING_PASSWORD`, `MODEL_NAME`, `STAGING_MODEL_NAME`, `AZURE_STORAGE_SAS_TOKEN` (DVC pull),
+`RENDER_DEPLOY_HOOK_URL` and `PROD_URL`.
+
+### Decisions
+
+The pipeline writes `results/decision.json` (uploaded as the `ct-results` artifact and shown in
+the job summary).
+
+| Decision | Meaning | Refresh |
+|---|---|---|
+| `bootstrapped` | no champion existed; the first model passed the gates and became champion | yes |
+| `promoted` | retraining was triggered and the candidate beat the champion under `ml/gates.yaml` | yes |
+| `rolled_back` | the alias moved back to the requested approved version | yes |
+| `retain_no_retraining` | the champion is healthy on this data; nothing trained | no |
+| `retain_rejected` | a candidate was trained and registered but failed the gates; champion unchanged | no |
+| `rollback_unchanged` | the alias already pointed to the requested version | no |
+| `failed` | data contract, registry or rollback check failed; champion unchanged; the job fails | no |
+
+### How the app is refreshed
+
+The app resolves `MODEL_NAME@champion` only at start-up. When the champion moves on the
+`production` target, the workflow:
+
+1. reads the live image commit from `GET $PROD_URL/model-info` (`app_git_sha`), retrying for
+   about 3 minutes in case the free instance is asleep;
+2. re-deploys that same image `ghcr.io/iidavodka/mlops-project:<app_git_sha>` with the deploy hook
+   (a restart: the code does not change);
+3. runs `scripts.smoke_test --expect-version <champion_after> --expect-app-sha <app_git_sha>`,
+   which waits (up to 15 minutes) until the new instance serves the new champion, because Render
+   keeps the old instance answering until the new one is ready.
+
+On `staging-demo` no app serves the model, so the workflow instead resolves
+`models:/<STAGING_MODEL_NAME>@champion`, checks it is `champion_after`, loads it and predicts three
+messages from `data/<dataset_version>/eval.csv` (or a fixed ham and spam message after a rollback).
+
+### Running the demos
+
+Use `target: staging-demo` to rehearse without touching production.
+
+1. **Bootstrap**: `operation: pipeline`, `dataset_version: v1`. With no champion yet, the decision
+   is `bootstrapped` (version 1).
+2. **No retraining needed**: run the same again. The champion is healthy on `v1`:
+   `retain_no_retraining`.
+3. **Retrain on new data**: `dataset_version: v2`. `v2` is newer than the champion's data, so the
+   pipeline retrains; the decision is `promoted` if the candidate passes the gates, otherwise
+   `retain_rejected`.
+4. **Rollback**: `operation: rollback`, `rollback_version: 1`. The decision is `rolled_back`
+   (or `rollback_unchanged` if version 1 is already champion).
+
+For production, run the same with `target: production` and check the job summary: the
+"live verification" row shows the live smoke-test result.
