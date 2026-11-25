@@ -58,27 +58,35 @@ def test_passes_against_a_healthy_app(healthy):
 
 
 def test_reports_wrong_model_version(healthy):
-    summary = smoke_test.run_checks(healthy, URL, expect_version="2", expect_app_sha="abc123")
+    summary = smoke_test.run_checks(
+        healthy, URL, expect_version="2", expect_app_sha="abc123", timeout=0, sleep=lambda _: None
+    )
 
-    failures = " ".join(summary["failures"])
-    assert "model_version '1', expected '2'" in failures
-    assert "/model-info: version '1', expected '2'" in failures
+    expected = (
+        "/model-info: never served app_git_sha 'abc123' and version '2' "
+        "(last answer: app_git_sha 'abc123', version '1')"
+    )
+    assert summary["failures"] == [expected]
 
 
-def old_then_new_image(new_after: int):
-    """Fake live URL: ready, but serves the old image for the first ``new_after`` polls."""
+def old_then_new_image(new_after: int, new_version: str = "1"):
+    """Fake live URL: ready, but serves the old instance (image "old", model version 1)
+    for the first ``new_after`` /model-info polls, then image "new" with ``new_version``."""
     polls = {"model-info": 0}
+
+    def current() -> tuple[str, str]:
+        return ("new", new_version) if polls["model-info"] > new_after else ("old", "1")
 
     def http(method, url, body):
         if url.endswith("/health/ready"):
-            return 200, {"status": "ready", "model_version": "1"}
+            return 200, {"status": "ready", "model_version": current()[1]}
         if url.endswith("/model-info"):
             polls["model-info"] += 1
-            sha = "new" if polls["model-info"] > new_after else "old"
-            return 200, {"version": "1", "app_git_sha": sha}
+            sha, version = current()
+            return 200, {"version": version, "app_git_sha": sha}
         if body == {"text": ""}:
             return 422, {"detail": "too short"}
-        return 200, {"prediction": "ham", "model_version": "1"}
+        return 200, {"prediction": "ham", "model_version": current()[1]}
 
     return http, polls
 
@@ -93,7 +101,7 @@ def test_waits_until_the_new_image_serves():
 
     assert summary["failures"] == []
     assert summary["app_git_sha"] == "new"
-    assert sleeps == [smoke_test.SHA_POLL_SECONDS] * 3  # three polls saw the old image
+    assert sleeps == [smoke_test.IDENTITY_POLL_SECONDS] * 3  # three polls saw the old image
     assert polls["model-info"] == 5  # four waiting polls, then the identity check
 
 
@@ -108,6 +116,28 @@ def test_fails_clearly_when_the_new_image_never_serves():
         "/model-info: never served app_git_sha 'new' (last answer: app_git_sha 'old')"
     ]
     assert "predictions" in summary and summary["predictions"] == {}  # stopped before predicting
+
+
+def test_waits_until_the_new_model_version_serves():
+    http, _ = old_then_new_image(new_after=2, new_version="3")
+    sleeps = []
+
+    summary = smoke_test.run_checks(http, URL, expect_version="3", timeout=60, sleep=sleeps.append)
+
+    assert summary["failures"] == []
+    assert summary["model_version"] == "3"
+    assert sleeps == [smoke_test.IDENTITY_POLL_SECONDS] * 2  # two polls saw version 1
+
+
+def test_fails_clearly_when_the_new_model_version_never_serves():
+    http, _ = old_then_new_image(new_after=10**9, new_version="3")
+
+    summary = smoke_test.run_checks(http, URL, expect_version="3", timeout=0, sleep=lambda _: None)
+
+    assert summary["failures"] == [
+        "/model-info: never served version '3' (last answer: version '1')"
+    ]
+    assert summary["predictions"] == {}  # stopped before predicting
 
 
 def test_reports_wrong_commit_against_the_real_app(healthy):
@@ -135,3 +165,11 @@ def test_main_exit_code(monkeypatch, capsys):
     monkeypatch.setattr(smoke_test, "run_checks", lambda *a, **k: {"failures": ["boom"]})
     assert smoke_test.main(["--url", URL]) == 1
     assert "FAILED: boom" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("option", ["--expect-version", "--expect-app-sha"])
+def test_empty_expectation_is_refused(option, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        smoke_test.main(["--url", URL, option, ""])
+    assert exit_info.value.code == 2
+    assert "empty value" in capsys.readouterr().err
